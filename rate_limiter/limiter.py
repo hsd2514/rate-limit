@@ -7,10 +7,10 @@ import time
 from pathlib import Path
 from typing import Optional
 import redis
-from .config import RATE_LIMITS, FAILURE_BEHAVIOR, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD
+from .config import RATE_LIMITS, FAILURE_BEHAVIOR, REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD , TIER_MULTIPLIERS , PENALTY_STEP, PENALTY_TTL_SECONDS
 
 
-def is_rate_limited(user_id: Optional[str], ip: str, endpoint: str) -> bool:
+def is_rate_limited(user_id: Optional[str], ip: str, endpoint: str , tier: Optional[str] = None) -> bool:
     """
     Returns True if the request should be blocked.
     Returns False if the request is allowed.
@@ -28,13 +28,31 @@ def is_rate_limited(user_id: Optional[str], ip: str, endpoint: str) -> bool:
     else:
         identifier = f"ip:{ip}"
     
+    
+    if tier is None:
+        tier = 'anonymous' if user_id is None else 'free'
+    
+
+
+    
+
     key = f"rate:{identifier}:{endpoint}"
     
     if endpoint not in RATE_LIMITS:
         return False
     
-    max_requests, window_seconds = RATE_LIMITS[endpoint]
+    
+   
+    base_max_requests, window_seconds = RATE_LIMITS[endpoint]
+    tier_multiplier = TIER_MULTIPLIERS.get(tier, 1)
+    max_requests = int(base_max_requests * tier_multiplier)
     redis_client = _get_redis_client()
+    penalty_key = f"penalty:{identifier}:{endpoint}"
+    penalty = int(redis_client.get(penalty_key) or 0)
+    raw_effective = max_requests - penalty * PENALTY_STEP
+    effective_max_requests = max(1, int(raw_effective))
+    
+
     
     try:
         count = redis_client.incr(key)
@@ -42,7 +60,9 @@ def is_rate_limited(user_id: Optional[str], ip: str, endpoint: str) -> bool:
         if count == 1:
             redis_client.expire(key, window_seconds)
         
-        if count > max_requests:
+        if count > effective_max_requests:
+            redis_client.incr(penalty_key)
+            redis_client.expire(penalty_key, PENALTY_TTL_SECONDS)
             return True
         
         return False
@@ -57,17 +77,26 @@ def is_rate_limited(user_id: Optional[str], ip: str, endpoint: str) -> bool:
         return False
 
 
-def is_rate_limited_sliding_window(user_id: Optional[str], ip: str, endpoint: str) -> bool:
+def is_rate_limited_sliding_window(user_id: Optional[str], ip: str, endpoint: str , tier: Optional[str] = None) -> bool:
     if user_id:
         identifier = f"user:{user_id}"
     else:
         identifier = f"ip:{ip}"
     
+    if tier is None:
+        tier = 'anonymous' if user_id is None else 'free'
+    
     if endpoint not in RATE_LIMITS:
         return False
     
-    max_requests, window_seconds = RATE_LIMITS[endpoint]
+    base_max_requests, window_seconds = RATE_LIMITS[endpoint]
+    tier_multiplier = TIER_MULTIPLIERS.get(tier, 1)
+    max_requests = int(base_max_requests * tier_multiplier)
     redis_client = _get_redis_client()
+    penalty_key = f"penalty:{identifier}:{endpoint}"
+    penalty = int(redis_client.get(penalty_key) or 0)
+    raw_effective = max_requests - penalty * PENALTY_STEP
+    effective_max_requests = max(1, int(raw_effective))
 
     try:
         now = time.time()
@@ -85,7 +114,9 @@ def is_rate_limited_sliding_window(user_id: Optional[str], ip: str, endpoint: st
 
         effective_count = current_count + (previous_count * weight)
         
-        if effective_count >= max_requests:
+        if effective_count >= effective_max_requests:
+            redis_client.incr(penalty_key)
+            redis_client.expire(penalty_key, PENALTY_TTL_SECONDS)
             return True
         
         redis_client.incr(current_key)
@@ -114,21 +145,30 @@ _lua_script_path = Path(__file__).parent / 'token_bucket.lua'
 with open(_lua_script_path, 'r') as f:
     token_bucket_lua = f.read()
 
-def is_rate_limited_token_bucket(user_id: Optional[str], ip: str, endpoint: str) -> bool:
+def is_rate_limited_token_bucket(user_id: Optional[str], ip: str, endpoint: str , tier: Optional[str] = None) -> bool:
     if user_id:
         identifier = f"user:{user_id}"
     else:
         identifier = f"ip:{ip}"
     
+    if tier is None:
+        tier = 'anonymous' if user_id is None else 'free'
+    
     if endpoint not in RATE_LIMITS:
         return False
     
-    max_requests, window_seconds = RATE_LIMITS[endpoint]
+    base_max_requests, window_seconds = RATE_LIMITS[endpoint]
+    tier_multiplier = TIER_MULTIPLIERS.get(tier, 1)
+    max_requests = int(base_max_requests * tier_multiplier)
     redis_client = _get_redis_client()
+    penalty_key = f"penalty:{identifier}:{endpoint}"
+    penalty = int(redis_client.get(penalty_key) or 0)
+    raw_effective = max_requests - penalty * PENALTY_STEP
+    effective_max_requests = max(1, int(raw_effective))
 
     key = f"rate:{identifier}:{endpoint}"
-    capacity = max_requests
-    refill_rate = max_requests / window_seconds 
+    capacity = effective_max_requests
+    refill_rate = effective_max_requests / window_seconds 
     cost = 1
     now = int(time.time())
 
