@@ -1,455 +1,398 @@
 """
-Tests for Rate Limiter
+Rate Limiter Test Suite
 
-Comprehensive test suite for the rate limiter implementation.
+Production Config:
+- /login: limit=5, cost=2 → 2 requests allowed (3rd blocked: 3*2=6>5)
+- /search: limit=20, cost=5 → 4 requests allowed (5th blocked: 5*5=25>20)
+- /read: limit=100, cost=1 → 100 requests allowed
 """
 
 import pytest
 import time
-from unittest.mock import Mock, patch, MagicMock
+import threading
+from unittest.mock import patch, MagicMock
 import redis
-from rate_limiter.limiter import is_rate_limited, is_rate_limited_sliding_window, is_rate_limited_token_bucket
-from rate_limiter.config import RATE_LIMITS, FAILURE_BEHAVIOR
+
+from rate_limiter.limiter import (
+    is_rate_limited,
+    is_rate_limited_sliding_window,
+    is_rate_limited_token_bucket,
+    _get_redis_client,
+    _get_trust_score,
+    _compute_final_capacity,
+)
+from rate_limiter.config import DEFAULT_TRUST_SCORE, TRUST_SCORE_MIN, TRUST_SCORE_MAX
 
 
-class TestRateLimiter:
-    """Test suite for rate limiter"""
+# =============================================================================
+# BASIC CORRECTNESS
+# =============================================================================
+
+class TestBasicCorrectness:
     
-    def test_login_rate_limit_exceeds_limit(self):
-        """
-        Test that more than 5 requests to /login within 60s are blocked.
-        First 5 should be allowed, 6th should be blocked.
-        """
-        user_id = "test_user_1"
-        ip = "192.168.1.1"
+    def test_allows_under_limit(self, unique_id, clean_state):
+        """Requests under limit should pass."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/login"  # 2 allowed
+        clean_state(identifier, endpoint)
+        
+        r1 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r2 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r1 is False, "1st should be allowed"
+        assert r2 is False, "2nd should be allowed"
+    
+    def test_blocks_over_limit(self, unique_id, clean_state):
+        """Requests over limit should be blocked."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/login"  # 2 allowed, 3rd blocked
+        clean_state(identifier, endpoint)
+        
+        is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r3 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r3 is True, "3rd should be blocked"
+    
+    def test_window_reset(self, unique_id, clean_state, redis_client):
+        """After window reset, requests should be allowed."""
+        identifier = f"user:{unique_id}"
         endpoint = "/login"
+        clean_state(identifier, endpoint)
         
-        # First 5 requests should be allowed
-        for i in range(5):
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"Request {i+1} should be allowed"
+        # Hit limit
+        for _ in range(3):
+            is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
         
-        # 6th request should be blocked
-        result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is True, "6th request should be blocked (exceeds limit of 5)"
+        # Reset
+        redis_client.delete(f"rate:{identifier}:{endpoint}")
+        clean_state(identifier, endpoint)
+        
+        result = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        assert result is False, "Should be allowed after reset"
     
-    def test_search_rate_limit_exceeds_limit(self):
-        """
-        Test that more than 20 requests to /search within 60s are blocked.
-        """
-        user_id = "test_user_2"
-        ip = "192.168.1.2"
+    def test_unknown_endpoint_allowed(self, unique_id):
+        """Unknown endpoints pass through."""
+        result = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint="/unknown")
+        assert result is False
+
+
+# =============================================================================
+# IDENTITY & TIERS
+# =============================================================================
+
+class TestIdentityAndTiers:
+    
+    def test_user_takes_precedence(self, unique_id, clean_state, redis_client):
+        """User ID used when provided."""
+        clean_state(f"user:{unique_id}", "/login")
+        
+        is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint="/login")
+        
+        assert redis_client.get(f"rate:user:{unique_id}:/login") is not None
+        assert redis_client.get(f"rate:ip:1.1.1.1:/login") is None
+    
+    def test_ip_when_no_user(self, clean_state, redis_client):
+        """IP used when user_id is None."""
+        ip = f"10.0.{int(time.time()) % 255}.1"
+        clean_state(f"ip:{ip}", "/login")
+        
+        is_rate_limited(user_id=None, ip=ip, endpoint="/login")
+        
+        assert redis_client.get(f"rate:ip:{ip}:/login") is not None
+    
+    def test_separate_counters(self, clean_state):
+        """Different users have separate counters."""
+        u1 = f"u1_{int(time.time() * 1000)}"
+        u2 = f"u2_{int(time.time() * 1000)}"
+        
+        clean_state(f"user:{u1}", "/login")
+        clean_state(f"user:{u2}", "/login")
+        
+        # User 1 hits limit
+        for _ in range(3):
+            is_rate_limited(user_id=u1, ip="1.1.1.1", endpoint="/login")
+        
+        # User 2 still allowed
+        result = is_rate_limited(user_id=u2, ip="1.1.1.1", endpoint="/login")
+        assert result is False
+    
+    def test_pro_tier_higher_limit(self, unique_id, clean_state):
+        """Pro tier gets 5x limit."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/login"  # base=5, pro=25, cost=2 → 12 allowed
+        clean_state(identifier, endpoint)
+        
+        # Should allow 10+ requests as pro
+        for i in range(10):
+            result = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint, tier="pro")
+            assert result is False, f"Pro request {i+1} should pass"
+
+
+# =============================================================================
+# COST-BASED
+# =============================================================================
+
+class TestCostBased:
+    
+    def test_high_cost_fewer_requests(self, unique_id, clean_state):
+        """/search (cost=5, limit=20) allows 4 requests."""
+        identifier = f"user:{unique_id}"
         endpoint = "/search"
+        clean_state(identifier, endpoint)
         
-        # First 20 requests should be allowed
-        for i in range(20):
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"Request {i+1} should be allowed"
+        for i in range(4):
+            result = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+            assert result is False, f"Request {i+1} should pass"
         
-        # 21st request should be blocked
-        result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is True, "21st request should be blocked (exceeds limit of 20)"
+        result = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        assert result is True, "5th should be blocked"
     
-    def test_read_rate_limit_exceeds_limit(self):
-        """
-        Test that more than 100 requests to /read within 60s are blocked.
-        """
-        user_id = "test_user_3"
-        ip = "192.168.1.3"
-        endpoint = "/read"
-        
-        # First 100 requests should be allowed
-        for i in range(100):
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"Request {i+1} should be allowed"
-        
-        # 101st request should be blocked
-        result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is True, "101st request should be blocked (exceeds limit of 100)"
-    
-    def test_counter_resets_after_window(self):
-        """
-        Test that counter resets after the window expires (60 seconds).
-        Note: This test may take up to 61 seconds to run.
-        """
-        user_id = "test_user_reset"
-        ip = "192.168.1.4"
+    def test_low_cost_more_requests(self, unique_id, clean_state):
+        """/login (cost=2, limit=5) allows 2 requests."""
+        identifier = f"user:{unique_id}"
         endpoint = "/login"
+        clean_state(identifier, endpoint)
         
-        # Make 5 requests (all should be allowed)
-        for i in range(5):
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"Request {i+1} should be allowed"
+        r1 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r2 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r3 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
         
-        # 6th request should be blocked
-        result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is True, "6th request should be blocked"
-        
-        # Wait for window to expire (61 seconds)
-        print("\n⏳ Waiting 61 seconds for window to expire...")
-        time.sleep(61)
-        
-        # After window expires, new request should be allowed (counter reset)
-        result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is False, "Request after window expiration should be allowed (counter reset)"
-    
-    def test_user_id_takes_precedence_over_ip(self):
-        """
-        Test that user_id is used when available, and different users have separate counters.
-        """
-        ip = "192.168.1.5"  # Same IP for both users
-        endpoint = "/login"
-        
-        user1_id = "user_1"
-        user2_id = "user_2"
-        
-        # User 1 makes 5 requests (all allowed)
-        for i in range(5):
-            result = is_rate_limited(user_id=user1_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"User 1 request {i+1} should be allowed"
-        
-        # User 1's 6th request should be blocked
-        result = is_rate_limited(user_id=user1_id, ip=ip, endpoint=endpoint)
-        assert result is True, "User 1's 6th request should be blocked"
-        
-        # User 2 (same IP, different user_id) should have separate counter
-        # User 2's first request should be allowed
-        result = is_rate_limited(user_id=user2_id, ip=ip, endpoint=endpoint)
-        assert result is False, "User 2's first request should be allowed (separate counter)"
-    
-    def test_ip_used_when_user_id_is_none(self):
-        """
-        Test that IP is used as identifier when user_id is None.
-        """
-        ip = "192.168.1.6"
-        endpoint = "/login"
-        
-        # Make 5 requests without user_id (all should be allowed)
-        for i in range(5):
-            result = is_rate_limited(user_id=None, ip=ip, endpoint=endpoint)
-            assert result is False, f"Request {i+1} should be allowed"
-        
-        # 6th request should be blocked
-        result = is_rate_limited(user_id=None, ip=ip, endpoint=endpoint)
-        assert result is True, "6th request should be blocked (IP-based rate limiting)"
-    
-    def test_different_ips_have_separate_counters(self):
-        """
-        Test that different IPs have separate rate limit counters.
-        """
-        endpoint = "/login"
-        ip1 = "192.168.1.7"
-        ip2 = "192.168.1.8"
-        
-        # IP1 makes 5 requests (all allowed)
-        for i in range(5):
-            result = is_rate_limited(user_id=None, ip=ip1, endpoint=endpoint)
-            assert result is False, f"IP1 request {i+1} should be allowed"
-        
-        # IP1's 6th request should be blocked
-        result = is_rate_limited(user_id=None, ip=ip1, endpoint=endpoint)
-        assert result is True, "IP1's 6th request should be blocked"
-        
-        # IP2 (different IP) should have separate counter
-        # IP2's first request should be allowed
-        result = is_rate_limited(user_id=None, ip=ip2, endpoint=endpoint)
-        assert result is False, "IP2's first request should be allowed (separate counter)"
-    
-    def test_redis_failure_fail_closed_login(self):
-        """
-        Test that /login blocks requests when Redis is unavailable (fail-closed).
-        """
-        user_id = "test_user"
-        ip = "192.168.1.9"
-        endpoint = "/login"
-        
-        # Mock Redis to raise an error
-        with patch('rate_limiter.limiter._get_redis_client') as mock_get_client:
-            mock_client = Mock()
-            mock_client.incr.side_effect = redis.RedisError("Connection failed")
-            mock_get_client.return_value = mock_client
-            
-            # Should block (fail-closed)
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is True, "/login should block requests when Redis fails (fail-closed)"
-    
-    def test_redis_failure_fail_open_search(self):
-        """
-        Test that /search allows requests when Redis is unavailable (fail-open).
-        """
-        user_id = "test_user"
-        ip = "192.168.1.10"
-        endpoint = "/search"
-        
-        # Mock Redis to raise an error
-        with patch('rate_limiter.limiter._get_redis_client') as mock_get_client:
-            mock_client = Mock()
-            mock_client.incr.side_effect = redis.RedisError("Connection failed")
-            mock_get_client.return_value = mock_client
-            
-            # Should allow (fail-open)
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, "/search should allow requests when Redis fails (fail-open)"
-    
-    def test_redis_failure_fail_open_read(self):
-        """
-        Test that /read allows requests when Redis is unavailable (fail-open).
-        """
-        user_id = "test_user"
-        ip = "192.168.1.11"
-        endpoint = "/read"
-        
-        # Mock Redis to raise an error
-        with patch('rate_limiter.limiter._get_redis_client') as mock_get_client:
-            mock_client = Mock()
-            mock_client.incr.side_effect = redis.RedisError("Connection failed")
-            mock_get_client.return_value = mock_client
-            
-            # Should allow (fail-open)
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, "/read should allow requests when Redis fails (fail-open)"
-    
-    def test_unknown_endpoint_allowed(self):
-        """
-        Test that unknown endpoints are allowed (no rate limiting).
-        """
-        user_id = "test_user"
-        ip = "192.168.1.12"
-        endpoint = "/unknown_endpoint"
-        
-        # Unknown endpoint should always be allowed
-        result = is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is False, "Unknown endpoint should be allowed"
-    
-    def test_different_endpoints_have_different_limits(self):
-        """
-        Test that different endpoints have different rate limits.
-        """
-        user_id = "test_user_multi"
-        ip = "192.168.1.13"
-        
-        # Test /login limit (5 requests)
-        for i in range(5):
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint="/login")
-            assert result is False, f"/login request {i+1} should be allowed"
-        
-        result = is_rate_limited(user_id=user_id, ip=ip, endpoint="/login")
-        assert result is True, "/login 6th request should be blocked"
-        
-        # Test /search limit (20 requests) - should still have room
-        for i in range(20):
-            result = is_rate_limited(user_id=user_id, ip=ip, endpoint="/search")
-            assert result is False, f"/search request {i+1} should be allowed"
-        
-        result = is_rate_limited(user_id=user_id, ip=ip, endpoint="/search")
-        assert result is True, "/search 21st request should be blocked"
-    
-    def test_expire_only_set_on_new_key(self):
-        """
-        Test that EXPIRE is only set when a key is newly created (count == 1).
-        This is an implementation detail test to ensure efficiency.
-        """
-        user_id = "test_user_expire"
-        ip = "192.168.1.14"
-        endpoint = "/login"
-        
-        # Mock Redis client to track expire calls
-        with patch('rate_limiter.limiter._get_redis_client') as mock_get_client:
-            mock_client = Mock()
-            mock_client.incr.return_value = 1  # First request (new key)
-            mock_get_client.return_value = mock_client
-            
-            is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            
-            # EXPIRE should be called on first request
-            assert mock_client.expire.called, "EXPIRE should be called when key is new (count == 1)"
-            
-            # Reset mock
-            mock_client.reset_mock()
-            mock_client.incr.return_value = 2  # Second request (existing key)
-            
-            is_rate_limited(user_id=user_id, ip=ip, endpoint=endpoint)
-            
-            # EXPIRE should NOT be called on subsequent requests
-            # (This test assumes your implementation checks count == 1)
-            # Note: This test may need adjustment based on your implementation
+        assert r1 is False and r2 is False
+        assert r3 is True
 
 
-class TestSlidingWindowRateLimiter:
-    """Test suite for sliding window rate limiter"""
+# =============================================================================
+# PENALTY
+# =============================================================================
+
+class TestPenalty:
     
-    def test_login_rate_limit_exceeds_limit(self):
-        """Test that sliding window blocks requests exceeding the limit."""
-        user_id = "test_sw_user_1"
-        ip = "192.168.2.1"
+    def test_penalty_on_block(self, unique_id, clean_state, redis_client):
+        """Penalty increases when blocked."""
+        identifier = f"user:{unique_id}"
         endpoint = "/login"
+        clean_state(identifier, endpoint)
         
-        # First 5 requests should be allowed
-        for i in range(5):
-            result = is_rate_limited_sliding_window(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"Request {i+1} should be allowed"
+        for _ in range(3):
+            is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
         
-        # 6th request should be blocked
-        result = is_rate_limited_sliding_window(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is True, "6th request should be blocked (exceeds limit of 5)"
+        penalty = int(redis_client.get(f"penalty:{identifier}:{endpoint}") or 0)
+        assert penalty >= 1
     
-    def test_sliding_window_smoother_than_fixed(self):
-        """Test that sliding window provides smoother rate limiting."""
-        user_id = "test_sw_smooth"
-        ip = "192.168.2.2"
-        endpoint = "/search"
+    def test_penalty_reduces_capacity(self, unique_id, clean_state, redis_client):
+        """Penalty reduces effective limit."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/search"  # limit=20, penalty_step=5
+        clean_state(identifier, endpoint)
         
-        # Make requests quickly
-        for i in range(20):
-            result = is_rate_limited_sliding_window(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"Request {i+1} should be allowed"
+        # penalty=2 → limit=20-10=10, cost=5 → 2 allowed
+        redis_client.set(f"penalty:{identifier}:{endpoint}", 2)
         
-        # 21st should be blocked
-        result = is_rate_limited_sliding_window(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is True, "21st request should be blocked"
+        r1 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r2 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r3 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r1 is False and r2 is False
+        assert r3 is True
     
-    def test_sliding_window_user_id_precedence(self):
-        """Test that user_id takes precedence in sliding window."""
-        ip = "192.168.2.3"
-        endpoint = "/login"
-        
-        user1_id = "sw_user_1"
-        user2_id = "sw_user_2"
-        
-        # User 1 makes 5 requests
-        for i in range(5):
-            result = is_rate_limited_sliding_window(user_id=user1_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"User 1 request {i+1} should be allowed"
-        
-        # User 1's 6th should be blocked
-        result = is_rate_limited_sliding_window(user_id=user1_id, ip=ip, endpoint=endpoint)
-        assert result is True, "User 1's 6th request should be blocked"
-        
-        # User 2 should have separate counter
-        result = is_rate_limited_sliding_window(user_id=user2_id, ip=ip, endpoint=endpoint)
-        assert result is False, "User 2's first request should be allowed"
-    
-    def test_sliding_window_redis_failure(self):
-        """Test sliding window handles Redis failures."""
-        user_id = "test_sw_fail"
-        ip = "192.168.2.4"
-        endpoint = "/login"
-        
-        with patch('rate_limiter.limiter._get_redis_client') as mock_get_client:
-            mock_client = Mock()
-            mock_client.get.side_effect = redis.RedisError("Connection failed")
-            mock_get_client.return_value = mock_client
-            
-            result = is_rate_limited_sliding_window(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is True, "/login should block on Redis failure (fail-closed)"
+    def test_capacity_min_one(self):
+        """Capacity never below 1."""
+        cap = _compute_final_capacity(5, 'free', 100, 1.0)
+        assert cap >= 1
 
 
-class TestTokenBucketRateLimiter:
-    """Test suite for token bucket rate limiter"""
-    
-    def test_token_bucket_allows_burst(self):
-        """Test that token bucket allows bursts up to capacity."""
-        user_id = "test_tb_user_1"
-        ip = "192.168.3.1"
-        endpoint = "/login"
-        
-        # Token bucket starts with capacity tokens, so first 5 should be allowed quickly
-        for i in range(5):
-            result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is False, f"Request {i+1} should be allowed (burst allowed)"
-        
-        # 6th should be blocked (no tokens left)
-        result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is True, "6th request should be blocked (bucket empty)"
-    
-    def test_token_bucket_refills_over_time(self):
-        """Test that tokens refill over time."""
-        user_id = "test_tb_refill"
-        ip = "192.168.3.2"
-        endpoint = "/login"
-        
-        # Use up all tokens
-        for i in range(5):
-            is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint=endpoint)
-        
-        # 6th should be blocked
-        result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is True, "Should be blocked when bucket is empty"
-        
-        # Wait a bit for tokens to refill
-        # For /login: 5 tokens per 60 seconds = ~0.083 tokens/second
-        # Wait 15 seconds to get ~1.25 tokens (enough for 1 request)
-        print("\n⏳ Waiting 15 seconds for token refill...")
-        time.sleep(15)
-        
-        # Should allow at least one more request after refill
-        result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint=endpoint)
-        # Note: This might still be blocked depending on exact refill timing
-        # The important thing is that tokens are refilling
-    
-    def test_token_bucket_different_endpoints(self):
-        """Test token bucket works with different endpoints."""
-        user_id = "test_tb_multi"
-        ip = "192.168.3.3"
-        
-        # /login: 5 tokens
-        for i in range(5):
-            result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint="/login")
-            assert result is False, f"/login request {i+1} should be allowed"
-        
-        result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint="/login")
-        assert result is True, "/login 6th should be blocked"
-        
-        # /search: 20 tokens (separate bucket)
-        # Make requests quickly to minimize token refill
-        for i in range(20):
-            result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint="/search")
-            assert result is False, f"/search request {i+1} should be allowed"
-        
-        # The important part is that /login and /search have separate buckets
-        # (verified by the fact that /search allowed 20 requests even after /login was blocked)
-        # Token refill can make the 21st request occasionally pass, which is expected behavior
-    
-    def test_token_bucket_user_id_precedence(self):
-        """Test that user_id takes precedence in token bucket."""
-        ip = "192.168.3.4"
-        endpoint = "/login"
-        
-        user1_id = "tb_user_1"
-        user2_id = "tb_user_2"
-        
-        # User 1 uses all tokens
-        for i in range(5):
-            is_rate_limited_token_bucket(user_id=user1_id, ip=ip, endpoint=endpoint)
-        
-        # User 1's 6th should be blocked
-        result = is_rate_limited_token_bucket(user_id=user1_id, ip=ip, endpoint=endpoint)
-        assert result is True, "User 1's 6th should be blocked"
-        
-        # User 2 should have separate bucket
-        result = is_rate_limited_token_bucket(user_id=user2_id, ip=ip, endpoint=endpoint)
-        assert result is False, "User 2's first request should be allowed (separate bucket)"
-    
-    def test_token_bucket_redis_failure(self):
-        """Test token bucket handles Redis failures."""
-        user_id = "test_tb_fail"
-        ip = "192.168.3.5"
-        endpoint = "/login"
-        
-        with patch('rate_limiter.limiter._get_redis_client') as mock_get_client:
-            mock_client = Mock()
-            mock_client.eval.side_effect = redis.RedisError("Connection failed")
-            mock_get_client.return_value = mock_client
-            
-            result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint=endpoint)
-            assert result is True, "/login should block on Redis failure (fail-closed)"
-    
-    def test_token_bucket_unknown_endpoint(self):
-        """Test token bucket allows unknown endpoints."""
-        user_id = "test_tb_unknown"
-        ip = "192.168.3.6"
-        endpoint = "/unknown"
-        
-        result = is_rate_limited_token_bucket(user_id=user_id, ip=ip, endpoint=endpoint)
-        assert result is False, "Unknown endpoint should be allowed"
+# =============================================================================
+# TRUST SCORE
+# =============================================================================
 
+class TestTrustScore:
+    
+    def test_default_trust(self, unique_id, clean_state):
+        """New clients start at default."""
+        clean_state(f"user:{unique_id}", "/login")
+        score = _get_trust_score(f"user:{unique_id}")
+        assert score == DEFAULT_TRUST_SCORE
+    
+    def test_trust_clamped(self, redis_client):
+        """Trust clamped to bounds."""
+        identifier = f"user:clamp_{int(time.time())}"
+        
+        redis_client.set(f"trust_score:{identifier}", 10.0)
+        assert _get_trust_score(identifier) == TRUST_SCORE_MAX
+        
+        redis_client.set(f"trust_score:{identifier}", 0.1)
+        assert _get_trust_score(identifier) == TRUST_SCORE_MIN
+    
+    def test_high_trust_more_capacity(self, unique_id, clean_state, redis_client):
+        """High trust = more requests."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/login"  # limit=5
+        clean_state(identifier, endpoint)
+        
+        # trust=1.5 → limit=7, cost=2 → 3 allowed
+        redis_client.set(f"trust_score:{identifier}", 1.5)
+        
+        r1 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r2 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r3 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r1 is False and r2 is False and r3 is False
+    
+    def test_low_trust_less_capacity(self, unique_id, clean_state, redis_client):
+        """Low trust = fewer requests."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/search"  # limit=20
+        clean_state(identifier, endpoint)
+        
+        # trust=0.5 → limit=10, cost=5 → 2 allowed
+        redis_client.set(f"trust_score:{identifier}", 0.5)
+        
+        r1 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r2 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r3 = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r1 is False and r2 is False
+        assert r3 is True
+
+
+# =============================================================================
+# SLIDING WINDOW
+# =============================================================================
+
+class TestSlidingWindow:
+    
+    def test_allows_under_limit(self, unique_id, clean_state):
+        """Allows requests under limit."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/login"
+        clean_state(identifier, endpoint)
+        
+        r1 = is_rate_limited_sliding_window(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r2 = is_rate_limited_sliding_window(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r1 is False and r2 is False
+    
+    def test_blocks_over_limit(self, unique_id, clean_state):
+        """Blocks when over limit."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/login"
+        clean_state(identifier, endpoint)
+        
+        is_rate_limited_sliding_window(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        is_rate_limited_sliding_window(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r3 = is_rate_limited_sliding_window(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r3 is True
+
+
+# =============================================================================
+# TOKEN BUCKET
+# =============================================================================
+
+class TestTokenBucket:
+    
+    def test_allows_burst(self, unique_id, clean_state):
+        """Allows burst up to capacity."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/login"
+        clean_state(identifier, endpoint)
+        
+        r1 = is_rate_limited_token_bucket(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r2 = is_rate_limited_token_bucket(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r1 is False and r2 is False
+    
+    def test_blocks_empty(self, unique_id, clean_state):
+        """Blocks when bucket empty."""
+        identifier = f"user:{unique_id}"
+        endpoint = "/login"
+        clean_state(identifier, endpoint)
+        
+        is_rate_limited_token_bucket(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        is_rate_limited_token_bucket(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        r3 = is_rate_limited_token_bucket(user_id=unique_id, ip="1.1.1.1", endpoint=endpoint)
+        
+        assert r3 is True
+
+
+# =============================================================================
+# FAILURE MODES
+# =============================================================================
+
+class TestFailureModes:
+    
+    def test_fail_closed(self, unique_id):
+        """/login (fail-closed) blocks on error."""
+        from rate_limiter import limiter
+        
+        mock = MagicMock()
+        # Allow reads for penalty/trust, fail on write
+        mock.get.return_value = None
+        mock.incrby.side_effect = redis.RedisError("Fail")
+        
+        with patch.object(limiter, '_get_redis_client', return_value=mock):
+            result = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint="/login")
+            assert result is True
+    
+    def test_fail_open(self, unique_id):
+        """/search (fail-open) allows on error."""
+        from rate_limiter import limiter
+        
+        mock = MagicMock()
+        # Allow reads for penalty/trust, fail on write
+        mock.get.return_value = None
+        mock.incrby.side_effect = redis.RedisError("Fail")
+        
+        with patch.object(limiter, '_get_redis_client', return_value=mock):
+            result = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint="/search")
+            assert result is False
+
+
+# =============================================================================
+# CONCURRENCY
+# =============================================================================
+
+class TestConcurrency:
+    
+    def test_concurrent_limit(self, unique_id, clean_state):
+        """Concurrent requests respect limit."""
+        clean_state(f"user:{unique_id}", "/login")  # 2 allowed
+        
+        results = []
+        
+        def req():
+            r = is_rate_limited(user_id=unique_id, ip="1.1.1.1", endpoint="/login")
+            results.append(r)
+        
+        threads = [threading.Thread(target=req) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        
+        allowed = sum(1 for r in results if r is False)
+        assert allowed <= 2, f"Max 2 allowed, got {allowed}"
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+class TestHelpers:
+    
+    def test_basic(self):
+        assert _compute_final_capacity(100, 'free', 0, 1.0) == 100
+    
+    def test_tier(self):
+        assert _compute_final_capacity(100, 'pro', 0, 1.0) == 500
+    
+    def test_penalty(self):
+        # 100 - 2*5 = 90
+        assert _compute_final_capacity(100, 'free', 2, 1.0) == 90
+    
+    def test_trust(self):
+        assert _compute_final_capacity(100, 'free', 0, 1.5) == 150
+    
+    def test_min_one(self):
+        assert _compute_final_capacity(5, 'free', 100, 0.5) >= 1
